@@ -3,45 +3,43 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
+	"fmt"
 	"log"
-	"os"
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
 )
 
-// Load wallets from file
-func LoadWallets() {
-	data, err := os.ReadFile(walletsFile)
-	if err == nil {
-		json.Unmarshal(data, &BC.Wallets)
+// Wallet structure with Dilithium PQC keys
+type Wallet struct {
+	Address    string            `json:"address"`
+	PrivateKey *mode3.PrivateKey `json:"-"`
+	PublicKey  *mode3.PublicKey  `json:"-"`
+}
+
+// GenerateWallet creates a new wallet with a Dilithium key pair
+func GenerateWallet() *Wallet {
+	// Generate a secure random seed
+	seed := make([]byte, mode3.SeedSize)
+	_, err := rand.Read(seed)
+	if err != nil {
+		log.Fatal("❌ Failed to generate random seed:", err)
+	}
+
+	// Generate Dilithium keys from the seed
+	priv := mode3.NewKeyFromSeed(seed)
+	pub := priv.Public()
+
+	// Create a wallet
+	return &Wallet{
+		Address:    hex.EncodeToString(pub.Bytes()), // Address derived from public key
+		PrivateKey: priv,
+		PublicKey:  pub,
 	}
 }
 
-// Save wallets to file
-func SaveWallets() {
-	data, _ := json.Marshal(BC.Wallets)
-	os.WriteFile(walletsFile, data, 0644)
-}
-
-// Create a new wallet
-func CreateWallet() *Wallet {
-	privateKey, publicKey, _ := mode3.GenerateKey(rand.Reader)
-	address := hex.EncodeToString(publicKey.Bytes())[:12]
-
-	wallet := &Wallet{
-		Address:    address,
-		Balance:    1000,
-		Stake:      0,
-		Nonce:      0,
-		PrivateKey: privateKey,
-		PublicKey:  publicKey,
-	}
-
-	BC.mutex.Lock()
-	defer BC.mutex.Unlock()
-	BC.Wallets = append(BC.Wallets, wallet)
-	SaveWallets()
-	log.Println("✅ Wallet Created: ", address)
-	return wallet
+func main() {
+	// Generate and display the wallet
+	wallet := GenerateWallet()
+	fmt.Println("✅ Wallet Created!")
+	fmt.Printf("📜 Address: %s\n", wallet.Address)
 }
