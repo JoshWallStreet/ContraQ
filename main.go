@@ -20,6 +20,7 @@ import (
 	"golang.org/x/crypto/argon2"
 )
 
+// Brute-force backstop globals
 var (
 	failedAttempts = make(map[string]int)
 	lockoutMutex   sync.Mutex
@@ -27,6 +28,7 @@ var (
 	lockedUntil    = make(map[string]time.Time)
 )
 
+// SecureWallet structure for persistence with Argon2id protection
 type SecureWallet struct {
 	Address             string `json:"address"`
 	PublicKey           []byte `json:"public_key"`
@@ -35,6 +37,7 @@ type SecureWallet struct {
 	Nonce               []byte `json:"nonce"`
 }
 
+// deriveKey utilizes Argon2id (Time: 1, Memory: 64MB, Parallelism: 4) to protect secrets
 func deriveKey(password string, salt []byte) []byte {
 	return argon2.IDKey([]byte(password), salt, 1, 64*1024, 4, 32)
 }
@@ -56,7 +59,7 @@ func recordFailedAttempt(ip string) {
 	failedAttempts[ip]++
 	if failedAttempts[ip] >= MaxAttempts {
 		lockedUntil[ip] = time.Now().Add(5 * time.Minute)
-		log.Printf("🚨 Node Alert: IP %s locked (threshold hit)", ip)
+		log.Printf("🚨 BACKSTOP TRIGGERED: IP %s restricted after %d attempts.", ip, MaxAttempts)
 	}
 }
 
@@ -69,13 +72,14 @@ func isLocked(ip string) bool {
 	return false
 }
 
+// LoadOrCreateKeystore creates a lattice-based identity or loads an existing encrypted one
 func LoadOrCreateKeystore(filename, password string) (*SecureWallet, mode3.PrivateKey, error) {
 	if _, err := os.Stat(filename); os.IsNotExist(err) {
 		var seed [32]byte
 		crand.Read(seed[:])
 		priv, pub := mode3.NewKeyFromSeed(&seed)
 
-		salt, nonce := make([]byte, 16), make([]byte, 12)
+		salt, nonce := make([]byte, 16), make([]byte, 12) // GCM Nonce size 12
 		crand.Read(salt)
 		crand.Read(nonce)
 
@@ -93,6 +97,7 @@ func LoadOrCreateKeystore(filename, password string) (*SecureWallet, mode3.Priva
 		}
 		data, _ := json.MarshalIndent(wallet, "", "  ")
 		ioutil.WriteFile(filename, data, 0600)
+		log.Println("📝 Quantum Keystore created with Argon2id protection.")
 		return wallet, priv, nil
 	}
 
@@ -105,18 +110,20 @@ func LoadOrCreateKeystore(filename, password string) (*SecureWallet, mode3.Priva
 	gcm, _ := cipher.NewGCM(block)
 	decrypted, err := gcm.Open(nil, wallet.Nonce, wallet.EncryptedPrivateKey, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("decryption failed: node is secure")
+		return nil, nil, fmt.Errorf("node security violation: decryption failed")
 	}
 
 	var privKey mode3.PrivateKey
 	copy(privKey[:], decrypted)
+	log.Println("🔑 Keystore successfully decrypted and loaded.")
 	return &wallet, privKey, nil
 }
 
 func main() {
+	// BabyStepsToTheBillion$$ - Ensure environment variable is set
 	pass := os.Getenv("CONTRAQ_KEY")
 	if pass == "" {
-		log.Fatal("ERROR: Secure node requires CONTRAQ_KEY environment variable.")
+		log.Fatal("ERROR: Node requires CONTRAQ_KEY environment variable to secure PQC identities.")
 	}
 
 	r := mux.NewRouter()
@@ -125,27 +132,38 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// GET: Retrieve Node Public Identity
 	r.HandleFunc("/wallet", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"address": ks.Address, "pqc_pub": hex.EncodeToString(ks.PublicKey)})
+		json.NewEncoder(w).Encode(map[string]string{
+			"address": ks.Address, 
+			"pqc_pub": hex.EncodeToString(ks.PublicKey),
+		})
 	}).Methods("GET")
 
+	// POST: Throttled Post-Quantum Message Signing
 	r.HandleFunc("/sign", func(w http.ResponseWriter, r *http.Request) {
 		ip := clientIPFromRequest(r)
 		if isLocked(ip) {
-			http.Error(w, "Locked: Too many attempts.", http.StatusTooManyRequests)
+			http.Error(w, "Locked: Brute-force threshold exceeded.", http.StatusTooManyRequests)
 			return
 		}
+
 		var req struct{ Message string `json:"message"` }
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			recordFailedAttempt(ip)
-			http.Error(w, "Bad JSON", http.StatusBadRequest)
+			http.Error(w, "Invalid Request Body", http.StatusBadRequest)
 			return
 		}
+
 		sig := priv.Sign([]byte(req.Message))
-		json.NewEncoder(w).Encode(map[string]string{"msg": req.Message, "sig": hex.EncodeToString(sig)})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"msg": req.Message, 
+			"sig": hex.EncodeToString(sig),
+		})
 	}).Methods("POST")
 
-	log.Printf("🚀 ContraQ Quantum Node Operational | Address: %s", ks.Address)
+	log.Printf("🚀 ContraQ Node Live | ID: %s", ks.Address)
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
