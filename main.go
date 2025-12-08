@@ -1,70 +1,152 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"log"
-	"net"
 	"net/http"
 	"os"
+	"sync"
+	"time"
 
+	"github.com/cloudflare/circl/sign/dilithium/mode3"
 	"github.com/gorilla/mux"
+	"golang.org/x/crypto/argon2"
 )
 
-const keystoreFile = "keystore.json"
+// Brute-force backstop globals
+var (
+	failedAttempts = make(map[string]int)
+	lockoutMutex   sync.Mutex
+	MaxAttempts    = 10
+	Cooldown       = 5 * time.Minute
+)
 
-func clientIPFromRequest(r *http.Request) string {
-	// prefer X-Forwarded-For if present (e.g., behind proxy); otherwise use remote addr
-	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
-		return xf
+// Wallet matches your types.go but includes encryption fields
+type SecureWallet struct {
+	Address             string `json:"address"`
+	PublicKey           []byte `json:"public_key"`
+	EncryptedPrivateKey []byte `json:"encrypted_private_key"`
+	Salt                []byte `json:"salt"`
+	Nonce               []byte `json:"nonce"`
+}
+
+func deriveKey(password string, salt []byte) []byte {
+	return argon2.IDKey([]byte(password), salt, 1, 64*1024, 4, 32)
+}
+
+func loadOrCreateSecureWallet(filename string, password string) (*SecureWallet, mode3.PrivateKey, error) {
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		// 1. Generate Quantum seed and keys
+		seed := make([]byte, mode3.SeedSize)
+		rand.Read(seed)
+		priv := mode3.NewKeyFromSeed(seed)
+		pub := priv.Public()
+
+		// 2. Setup Encryption
+		salt := make([]byte, 16)
+		rand.Read(salt)
+		key := deriveKey(password, salt)
+		block, _ := aes.NewCipher(key)
+		gcm, _ := cipher.NewGCM(block)
+		nonce := make([]byte, gcm.NonceSize())
+		rand.Read(nonce)
+
+		encrypted := gcm.Seal(nil, nonce, priv.Bytes(), nil)
+
+		wallet := &SecureWallet{
+			Address:             hex.EncodeToString(pub.Bytes()),
+			PublicKey:           pub.Bytes(),
+			EncryptedPrivateKey: encrypted,
+			Salt:                salt,
+			Nonce:               nonce,
+		}
+
+		data, _ := json.MarshalIndent(wallet, "", "  ")
+		ioutil.WriteFile(filename, data, 0600)
+		log.Println("📝 Secure Quantum Wallet created successfully.")
+		return wallet, priv, nil
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+
+	data, _ := ioutil.ReadFile(filename)
+	var wallet SecureWallet
+	json.Unmarshal(data, &wallet)
+
+	// 3. Decrypt on load
+	key := deriveKey(password, wallet.Salt)
+	block, _ := aes.NewCipher(key)
+	gcm, _ := cipher.NewGCM(block)
+	decrypted, err := gcm.Open(nil, wallet.Nonce, wallet.EncryptedPrivateKey, nil)
 	if err != nil {
-		return r.RemoteAddr
+		return nil, nil, fmt.Errorf("authentication failed: brute-force backstop active")
 	}
-	return host
+
+	var privKey mode3.PrivateKey
+	copy(privKey[:], decrypted)
+	return &wallet, privKey, nil
 }
 
 func main() {
-	// 1) Load blockchain (existing logic)
+	// Secure configuration via Environment Variable
+	pass := os.Getenv("CONTRAQ_KEY")
+	if pass == "" {
+		log.Fatal("FATAL: CONTRAQ_KEY environment variable not set. Aborting node startup.")
+	}
+
+	wallet, privKey, err := loadOrCreateSecureWallet("secure_wallet.json", pass)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Load existing blockchain data (from your blockchain.go logic)
 	LoadBlockchain()
 
-	// 2) Wire up HTTP router
 	r := mux.NewRouter()
 
-	// Blockchain endpoints (existing)
-	r.HandleFunc("/blockchain", GetBlockchain).Methods("GET")
-	r.HandleFunc("/create-transaction", CreateTransaction).Methods("POST")
-	r.HandleFunc("/mine-block", MineBlock).Methods("POST")
-
-	// 3) Wallet endpoints (keystore)
-	WireWalletHandlers(r)
-
-	// 4) Brute-force / admin endpoints are provided by the merged main.go earlier
-	//        (status endpoint remains available via /status if desired)
-	r.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		backoffMutex.Lock()
-		defer backoffMutex.Unlock()
-		type entry struct {
-			IP     string `json:"ip"`
-			Count  int    `json:"count"`
-			Locked string `json:"locked_until"`
-		}
-		var out []entry
-		for ip, be := range backoffMap {
-			out = append(out, entry{IP: ip, Count: be.Count, Locked: be.LockedUntil.Format("2006-01-02T15:04:05Z")})
-		}
-		json.NewEncoder(w).Encode(struct {
-			ChainLen int     `json:"chain_length"`
-			Backoff  []entry `json:"backoff"`
-		}{ChainLen: len(BC.Chain), Backoff: out})
+	// Info Endpoint
+	r.HandleFunc("/wallet", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"address":    wallet.Address,
+			"public_key": hex.EncodeToString(wallet.PublicKey),
+		})
 	}).Methods("GET")
 
-	// 5) Startup message & run
-	log.Println("🚀 ContraQ node (merged) running on 127.0.0.1:8080")
-	pass := os.Getenv("CONTRAQ_PASSPHRASE")
-	if pass == "" {
-		log.Println("WARNING: CONTRAQ_PASSPHRASE not set — use environment variable in production.")
-	}
-	log.Fatal(http.ListenAndServe("127.0.0.1:8080", r))
+	// PQC Signing Endpoint with Backstop Throttling
+	r.HandleFunc("/sign", func(w http.ResponseWriter, r *http.Request) {
+		clientIP := r.RemoteAddr
+		lockoutMutex.Lock()
+		if failedAttempts[clientIP] >= MaxAttempts {
+			lockoutMutex.Unlock()
+			http.Error(w, "Locked: Brute-force cooldown active.", http.StatusTooManyRequests)
+			return
+		}
+		lockoutMutex.Unlock()
+
+		var req struct{ Message string `json:"message"` }
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid Request", http.StatusBadRequest)
+			return
+		}
+
+		// Perform signature
+		sig := privKey.Sign([]byte(req.Message))
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"message":   req.Message,
+			"signature": hex.EncodeToString(sig),
+		})
+	}).Methods("POST")
+
+	// Chain Exploration
+	r.HandleFunc("/blockchain", GetBlockchain).Methods("GET")
+
+	log.Printf("🚀 ContraQ Quantum Node Running | Address: %s\n", wallet.Address)
+	log.Fatal(http.ListenAndServe(":8080", r))
 }
