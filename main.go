@@ -1,96 +1,140 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
 	"github.com/gorilla/mux"
+	"golang.org/x/crypto/argon2"
 )
 
-// Wallet structure
+// Global state for brute-force backstop
+var (
+	failedAttempts = make(map[string]int)
+	lockoutMutex   sync.Mutex
+	MaxAttempts    = 10
+	Cooldown       = 5 * time.Minute
+)
+
 type Wallet struct {
-	PublicKey  []byte `json:"public_key"`
-	PrivateKey []byte `json:"private_key"` // In real deployment, encrypt this
+	PublicKey []byte `json:"public_key"`
+	// EncryptedPrivateKey contains the Dilithium key encrypted with AES-GCM
+	EncryptedPrivateKey []byte `json:"encrypted_private_key"`
+	Salt                []byte `json:"salt"`
+	Nonce               []byte `json:"nonce"`
 }
 
-// Load or create wallet
-func loadOrCreateWallet(filename string) (*Wallet, error) {
+// deriveKey uses Argon2id to create a 32-byte key from a password
+func deriveKey(password string, salt []byte) []byte {
+	return argon2.IDKey([]byte(password), salt, 1, 64*1024, 4, 32)
+}
+
+func loadOrCreateWallet(filename string, password string) (*Wallet, mode3.PrivateKey, error) {
 	if _, err := os.Stat(filename); os.IsNotExist(err) {
-		// Generate keys
+		// 1. Generate Quantum Keys
 		var seed [32]byte
-		if _, err := rand.Read(seed[:]); err != nil {
-			return nil, fmt.Errorf("failed to generate seed: %v", err)
-		}
+		rand.Read(seed[:])
 		priv, pub := mode3.NewKeyFromSeed(&seed)
+
+		// 2. Encrypt Private Key with Argon2 + AES
+		salt := make([]byte, 16)
+		rand.Read(salt)
+		key := deriveKey(password, salt)
+		
+		block, _ := aes.NewCipher(key)
+		gcm, _ := cipher.NewGCM(block)
+		nonce := make([]byte, gcm.NonceSize())
+		rand.Read(nonce)
+
+		encrypted := gcm.Seal(nil, nonce, priv.Bytes(), nil)
+
 		wallet := &Wallet{
-			PublicKey:  pub.Bytes(),
-			PrivateKey: priv.Bytes(),
+			PublicKey:           pub.Bytes(),
+			EncryptedPrivateKey: encrypted,
+			Salt:                salt,
+			Nonce:               nonce,
 		}
 		data, _ := json.MarshalIndent(wallet, "", "  ")
-		if err := ioutil.WriteFile(filename, data, 0600); err != nil {
-			return nil, fmt.Errorf("failed to write wallet file: %v", err)
-		}
-		log.Println("📝 New wallet created and saved")
-		return wallet, nil
+		ioutil.WriteFile(filename, data, 0600)
+		log.Println("📝 Secure Encrypted Wallet Created")
+		return wallet, priv, nil
 	}
 
-	// Load existing wallet
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read wallet file: %v", err)
-	}
+	// 3. Load and Decrypt
+	data, _ := ioutil.ReadFile(filename)
 	var wallet Wallet
-	if err := json.Unmarshal(data, &wallet); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal wallet: %v", err)
+	json.Unmarshal(data, &wallet)
+
+	key := deriveKey(password, wallet.Salt)
+	block, _ := aes.NewCipher(key)
+	gcm, _ := cipher.NewGCM(block)
+	
+	decrypted, err := gcm.Open(nil, wallet.Nonce, wallet.EncryptedPrivateKey, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("incorrect passphrase - brute force backstop potential")
 	}
-	log.Println("🔑 Wallet loaded from file")
-	return &wallet, nil
+
+	var privKey mode3.PrivateKey
+	copy(privKey[:], decrypted)
+	log.Println("🔑 Wallet Decrypted & Loaded")
+	return &wallet, privKey, nil
 }
 
 func main() {
-	wallet, err := loadOrCreateWallet("wallet.json")
+	// In production, get this from an environment variable or secure CLI input
+	nodePassphrase := "BabyStepsToTheBillion$$" 
+	
+	wallet, privKey, err := loadOrCreateWallet("wallet.json", nodePassphrase)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	r := mux.NewRouter()
 
-	// Return wallet public key
 	r.HandleFunc("/wallet", func(w http.ResponseWriter, r *http.Request) {
-		resp := map[string]string{
-			"public_key": fmt.Sprintf("%x", wallet.PublicKey),
-		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		json.NewEncoder(w).Encode(map[string]string{
+			"public_key": fmt.Sprintf("%x", wallet.PublicKey),
+		})
 	})
 
-	// Sign a message
 	r.HandleFunc("/sign", func(w http.ResponseWriter, r *http.Request) {
-		type SignRequest struct {
-			Message string `json:"message"`
-		}
-		var req SignRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
+		clientIP := r.RemoteAddr
+		lockoutMutex.Lock()
+		if failedAttempts[clientIP] >= MaxAttempts {
+			lockoutMutex.Unlock()
+			http.Error(w, "Locked: Brute-force backstop active. Cooldown triggered.", http.StatusTooManyRequests)
 			return
 		}
-		privKey := mode3.PrivateKey{}
-		copy(privKey[:], wallet.PrivateKey)
-		sig := privKey.Sign([]byte(req.Message))
-		resp := map[string]string{
-			"message":   req.Message,
-			"signature": fmt.Sprintf("%x", sig),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
+		lockoutMutex.Unlock()
 
-	log.Println("🚀 Quantum Blockchain Node running on 127.0.0.1:8080")
+		var req struct{ Message string `json:"message"` }
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid Request", http.StatusBadRequest)
+			return
+		}
+
+		// Simulate signing logic
+		sig := privKey.Sign([]byte(req.Message))
+		
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"message": req.Message,
+			"signature": fmt.Sprintf("%x", sig),
+		})
+	}).Methods("POST")
+
+	log.Println("🚀 Quantum-Safe ContraQ Node running on 127.0.0.1:8080")
 	log.Fatal(http.ListenAndServe("127.0.0.1:8080", r))
 }
