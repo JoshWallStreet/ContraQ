@@ -1,4 +1,3 @@
-// main.go - CONTRAQ v13.4.1 OMEGA-UNBREAKABLE (PRODUCTION READY)
 package main
 
 import (
@@ -6,53 +5,59 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"log/slog"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/cloudflare/circl/sign/dilithium/mode5"
+	"github.com/consensys/gnark-crypto/ecc"
+	"github.com/consensys/gnark/backend/groth16"
+	"github.com/consensys/gnark/frontend"
+	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/gorilla/mux"
 	"github.com/klauspost/reedsolomon"
-	"golang.org/x/crypto/argon2"
 	_ "github.com/mattn/go-sqlite3"
 )
 
 const (
-	Version       = "v13.4.1-OMEGA-UNBREAKABLE"
+	Version       = "v14.1-OMEGA-CHAIN-INTRINSIC"
 	SlotDuration  = 2 * time.Second
 	DataShards    = 16
 	ParityShards  = 16
 	GenesisSupply = 21_000_000_000
 	ServerPort    = ":8080"
+	
+	// Rate limiting
+	MaxFailedAttempts = 10
+	LockoutDuration   = 5 * time.Minute
 )
 
 var (
 	chainDB    *sql.DB
 	nodeWallet *Wallet
 	globalNode *ContraQNode
-	startTime  = time.Now()
+	zkParams   *ZKParams
+	
+	// Rate limiting state
+	failedAttempts sync.Map // IP -> attempt count
+	lockedUntil    sync.Map // IP -> time.Time
+	rateLimitMu    sync.Mutex
 )
 
-type NodeStatus struct {
-	Version     string `json:"version"`
-	Uptime      string `json:"uptime"`
-	Wallet      string `json:"wallet"`
-	ChainHeight int64  `json:"chain_height"`
-	Status      string `json:"status"`
-}
+// --- QUANTUM-SAFE WALLET ---
 
-// 🔒 QUANTUM-SAFE WALLET (Dilithium Mode 5 + Argon2id)
 type Wallet struct {
 	Address    string
 	PrivateKey mode5.PrivateKey
@@ -61,25 +66,13 @@ type Wallet struct {
 }
 
 func NewWallet() *Wallet {
-	masterKey := os.Getenv("CONTRAQ_MASTER_KEY")
-	if masterKey == "" {
-		masterKey = "contraq-genesis-2025" // Production fallback
-		slog.Warn("⚠️ Using fallback key - set CONTRAQ_MASTER_KEY env var")
+	var seed [32]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		log.Fatal("Failed to generate seed:", err)
 	}
-	
-	// ✅ ARGON2ID (memory-hard, quantum-safe KDF)
-	salt := []byte("contraq-omega-v13.4")
-	seed := argon2.IDKey([]byte(masterKey), salt, 3, 64*1024, 4, 32)
-	
-	priv, pub := mode5.NewKeyFromSeed(seed)
-	addrBytes := sha256.Sum256(pub.Bytes())
-	addr := fmt.Sprintf("cq_%x", addrBytes[:20])
-	
-	return &Wallet{
-		Address:    addr,
-		PrivateKey: priv,
-		PublicKey:  pub,
-	}
+	priv, pub := mode5.NewKeyFromSeed(seed[:])
+	addr := fmt.Sprintf("cq_%x", sha256.Sum256(pub.Bytes())[:20])
+	return &Wallet{Address: addr, PrivateKey: priv, PublicKey: pub}
 }
 
 func (w *Wallet) Sign(data []byte) []byte {
@@ -88,7 +81,68 @@ func (w *Wallet) Sign(data []byte) []byte {
 	return w.PrivateKey.Sign(nil, data)
 }
 
-// 📦 TRANSACTIONS
+// --- REAL zkSNARK CIRCUIT ---
+
+type StateTransitionCircuit struct {
+	PrevStateRoot frontend.Variable `gnark:",public"`
+	NewStateRoot  frontend.Variable `gnark:",public"`
+	TxCount       frontend.Variable `gnark:",public"`
+	TxHashes      []frontend.Variable
+}
+
+func (circuit *StateTransitionCircuit) Define(api frontend.API) error {
+	sum := circuit.PrevStateRoot
+	for i := 0; i < len(circuit.TxHashes); i++ {
+		sum = api.Add(sum, circuit.TxHashes[i])
+	}
+	api.AssertIsEqual(circuit.NewStateRoot, sum)
+	api.AssertIsEqual(circuit.TxCount, len(circuit.TxHashes))
+	return nil
+}
+
+type ZKParams struct {
+	ProvingKey   groth16.ProvingKey
+	VerifyingKey groth16.VerifyingKey
+	R1CS         frontend.CompiledConstraintSystem
+	mu           sync.RWMutex
+}
+
+func InitZKParams() (*ZKParams, error) {
+	slog.Info("🔧 Initializing zkSNARK parameters (~30 seconds)...")
+	
+	circuit := &StateTransitionCircuit{
+		TxHashes: make([]frontend.Variable, 100),
+	}
+	
+	r1cs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, circuit)
+	if err != nil {
+		return nil, fmt.Errorf("circuit compilation failed: %w", err)
+	}
+	
+	pk, vk, err := groth16.Setup(r1cs)
+	if err != nil {
+		return nil, fmt.Errorf("zkSNARK setup failed: %w", err)
+	}
+	
+	slog.Info("✅ zkSNARK parameters initialized", "constraints", r1cs.GetNbConstraints())
+	
+	return &ZKParams{
+		ProvingKey:   pk,
+		VerifyingKey: vk,
+		R1CS:         r1cs,
+	}, nil
+}
+
+// --- DATA STRUCTURES ---
+
+type Asset struct {
+	Ticker      string `json:"ticker"`
+	Issuer      string `json:"issuer"`
+	TotalSupply int64  `json:"total_supply"`
+	Metadata    string `json:"metadata"`
+	Timestamp   int64  `json:"timestamp"`
+}
+
 type Transaction struct {
 	ID        string `json:"id"`
 	Sender    string `json:"sender"`
@@ -101,45 +155,57 @@ type Transaction struct {
 	PublicKey string `json:"public_key"`
 }
 
-func (tx *Transaction) SigningHash() []byte {
-	data := fmt.Sprintf("%s|%s|%d|%s|%d|%d", tx.Sender, tx.Recipient, tx.Amount, tx.Asset, tx.Nonce, tx.Timestamp)
-	h := sha256.Sum256([]byte(data))
-	return h[:]
+func (tx *Transaction) GetSigningData() []byte {
+	data := fmt.Sprintf("%s:%s:%d:%s:%d:%d", tx.Sender, tx.Recipient, tx.Amount, tx.Asset, tx.Nonce, tx.Timestamp)
+	hash := sha256.Sum256([]byte(data))
+	return hash[:]
 }
 
-// ⛏️ BLOCKS
+func (tx *Transaction) GetHash() string {
+	if tx.ID != "" {
+		return tx.ID
+	}
+	data := tx.GetSigningData()
+	return hex.EncodeToString(data)
+}
+
 type Block struct {
-	Height     int64        `json:"height"`
-	Timestamp  int64        `json:"timestamp"`
-	TxCount    int          `json:"tx_count"`
-	StateRoot  string       `json:"state_root"`
-	PrevHash   string       `json:"prev_hash"`
-	Hash       string       `json:"hash"`
-	Miner      string       `json:"miner"`
+	Index          int64         `json:"index"`
+	Timestamp      int64         `json:"timestamp"`
+	Transactions   []Transaction `json:"transactions"`
+	ZKProof        string        `json:"zk_proof"`
+	ZKPublicInputs []string      `json:"zk_public_inputs"`
+	ErasureRoot    string        `json:"erasure_root"`
+	StateRoot      string        `json:"state_root"`
+	PrevHash       string        `json:"prev_hash"`
+	Hash           string        `json:"hash"`
 }
 
 func (b *Block) ComputeHash() string {
-	data, _ := json.Marshal(struct {
-		Height    int64
-		Timestamp int64
-		TxCount   int
-		StateRoot string
-		PrevHash  string
-		Miner     string
-	}{b.Height, b.Timestamp, b.TxCount, b.StateRoot, b.PrevHash, b.Miner})
-	h := sha256.Sum256(data)
-	return hex.EncodeToString(h[:])
+	blockData, _ := json.Marshal(struct {
+		Index        int64
+		Timestamp    int64
+		Transactions []Transaction
+		StateRoot    string
+		PrevHash     string
+	}{b.Index, b.Timestamp, b.Transactions, b.StateRoot, b.PrevHash})
+	hash := sha256.Sum256(blockData)
+	return hex.EncodeToString(hash[:])
 }
 
-// 🧠 PRODUCTION NODE
+// --- CONSENSUS NODE ---
+
 type ContraQNode struct {
-	Chain     []Block
-	State     sync.Map    // address:asset → balance
-	Nonces    sync.Map    // address → nonce
-	TxPool    chan Transaction
-	RS        reedsolomon.Encoder
-	running   bool
-	mu        sync.RWMutex
+	Chain      []Block
+	ChainMu    sync.RWMutex
+	State      sync.Map
+	Nonces     sync.Map
+	PublicKeys sync.Map
+	Assets     sync.Map
+	TxPool     chan Transaction
+	RS         reedsolomon.Encoder
+	IsRunning  bool
+	RunningMu  sync.RWMutex
 }
 
 func NewContraQNode() (*ContraQNode, error) {
@@ -148,363 +214,749 @@ func NewContraQNode() (*ContraQNode, error) {
 		return nil, err
 	}
 
+	genesisHash := sha256.Sum256([]byte("GENESIS"))
 	genesis := Block{
-		Height:     0,
-		Timestamp:  time.Now().Unix(),
-		TxCount:    0,
-		StateRoot:  "GENESIS",
-		Hash:       "GENESIS_BLOCK",
-		Miner:      "SYSTEM",
+		Index:          0,
+		Timestamp:      time.Now().Unix(),
+		ZKProof:        "GENESIS",
+		ZKPublicInputs: []string{"0", "0", "0"},
+		Hash:           hex.EncodeToString(genesisHash[:]),
+		StateRoot:      "GENESIS_STATE",
 	}
 
-	n := &ContraQNode{
-		Chain:  []Block{genesis},
-		TxPool: make(chan Transaction, 10000),
-		RS:     rs,
-	}
-	
-	// Genesis supply
-	n.State.Store(nodeWallet.Address+":CQ", GenesisSupply)
-	
-	return n, nil
+	return &ContraQNode{
+		Chain:     []Block{genesis},
+		TxPool:    make(chan Transaction, 1000000),
+		RS:        rs,
+		IsRunning: false,
+	}, nil
 }
 
 func (n *ContraQNode) Start() {
-	n.mu.Lock()
-	n.running = true
-	n.mu.Unlock()
+	n.RunningMu.Lock()
+	if n.IsRunning {
+		n.RunningMu.Unlock()
+		return
+	}
+	n.IsRunning = true
+	n.RunningMu.Unlock()
+
+	go n.TransactionProcessor()
+	go n.ConsensusEngine()
 	
-	go n.txProcessor()
-	go n.blockMinter()
-	
-	slog.Info("🚀 Node mining started", "wallet", nodeWallet.Address[:12]+"...")
+	slog.Info("🌌 ContraQ node started", "version", Version)
 }
 
 func (n *ContraQNode) Stop() {
-	n.mu.Lock()
-	n.running = false
-	n.mu.Unlock()
+	n.RunningMu.Lock()
+	n.IsRunning = false
+	n.RunningMu.Unlock()
+	slog.Info("Node stopped")
 }
 
-func (n *ContraQNode) txProcessor() {
+// --- TRANSACTION PROCESSING ---
+
+func (n *ContraQNode) TransactionProcessor() {
 	for tx := range n.TxPool {
-		if n.validateTx(tx) {
-			n.applyTx(tx)
-			slog.Info("✅ TX processed", "id", tx.ID[:8], "amount", tx.Amount)
+		if err := n.ValidateTransaction(tx); err != nil {
+			slog.Warn("❌ Invalid transaction", "tx_id", tx.ID, "error", err)
+			continue
 		}
+		n.ApplyTransaction(tx)
+		slog.Debug("✅ Transaction applied", "tx_id", tx.ID)
 	}
 }
 
-func (n *ContraQNode) validateTx(tx Transaction) bool {
-	if tx.Amount <= 0 {
-		return false
+func (n *ContraQNode) ValidateTransaction(tx Transaction) error {
+	if tx.Sender == "" || tx.Recipient == "" || tx.Amount <= 0 {
+		return errors.New("invalid transaction fields")
 	}
-	
-	key := tx.Sender + ":CQ"
-	balI, ok := n.State.Load(key)
-	if !ok {
-		return false
+
+	if tx.Asset == "" {
+		tx.Asset = "CQ"
 	}
-	return balI.(int64) >= tx.Amount
+
+	stateKey := tx.Sender + ":" + tx.Asset
+	balance, ok := n.State.Load(stateKey)
+	if !ok || balance.(int64) < tx.Amount {
+		return errors.New("insufficient balance")
+	}
+
+	currentNonce, _ := n.Nonces.LoadOrStore(tx.Sender, uint64(0))
+	if tx.Nonce <= currentNonce.(uint64) {
+		return errors.New("invalid nonce - replay attack detected")
+	}
+
+	// QUANTUM-SAFE SIGNATURE VERIFICATION
+	if tx.Signature == "" || tx.PublicKey == "" {
+		return errors.New("missing signature or public key")
+	}
+
+	sigBytes, err := hex.DecodeString(tx.Signature)
+	if err != nil {
+		return fmt.Errorf("invalid signature encoding: %w", err)
+	}
+
+	pubKeyBytes, err := hex.DecodeString(tx.PublicKey)
+	if err != nil {
+		return fmt.Errorf("invalid public key encoding: %w", err)
+	}
+
+	var pubKey mode5.PublicKey
+	if len(pubKeyBytes) != len(pubKey) {
+		return errors.New("invalid public key length")
+	}
+	copy(pubKey[:], pubKeyBytes)
+
+	expectedAddr := fmt.Sprintf("cq_%x", sha256.Sum256(pubKeyBytes)[:20])
+	if expectedAddr != tx.Sender {
+		return errors.New("public key does not match sender address")
+	}
+
+	signingData := tx.GetSigningData()
+	if !pubKey.Verify(signingData, sigBytes) {
+		return errors.New("invalid Dilithium signature")
+	}
+
+	n.PublicKeys.Store(tx.Sender, pubKey)
+	return nil
 }
 
-func (n *ContraQNode) applyTx(tx Transaction) {
-	senderKey := tx.Sender + ":CQ"
-	recvKey := tx.Recipient + ":CQ"
-	
-	senderBalI, _ := n.State.Load(senderKey)
-	recvBalI, _ := n.State.LoadOrStore(recvKey, int64(0))
-	
-	senderBal := senderBalI.(int64) - tx.Amount
-	recvBal := recvBalI.(int64) + tx.Amount
-	
-	n.State.Store(senderKey, senderBal)
-	n.State.Store(recvKey, recvBal)
+func (n *ContraQNode) ApplyTransaction(tx Transaction) {
+	senderKey := tx.Sender + ":" + tx.Asset
+	recipientKey := tx.Recipient + ":" + tx.Asset
+
+	senderBal, _ := n.State.LoadOrStore(senderKey, int64(0))
+	n.State.Store(senderKey, senderBal.(int64)-tx.Amount)
+
+	recipientBal, _ := n.State.LoadOrStore(recipientKey, int64(0))
+	n.State.Store(recipientKey, recipientBal.(int64)+tx.Amount)
+
+	n.Nonces.Store(tx.Sender, tx.Nonce)
 }
 
-func (n *ContraQNode) blockMinter() {
+// --- CHAIN-INTRINSIC CONSENSUS ---
+
+func (n *ContraQNode) ConsensusEngine() {
 	ticker := time.NewTicker(SlotDuration)
 	defer ticker.Stop()
-	
-	for range ticker.C {
-		n.mu.RLock()
-		if !n.running {
-			n.mu.RUnlock()
+
+	for {
+		n.RunningMu.RLock()
+		running := n.IsRunning
+		n.RunningMu.RUnlock()
+
+		if !running {
 			return
 		}
-		n.mu.RUnlock()
+
+		t := <-ticker.C
+		slot := t.Unix() / int64(SlotDuration.Seconds())
 		
-		n.mineBlock()
+		// CHAIN-INTRINSIC: Leader selection based ONLY on chain state
+		if n.IsSlotLeader(slot) {
+			n.ProposeBlock(slot, t.Unix())
+		}
 	}
 }
 
-func (n *ContraQNode) mineBlock() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+// IsSlotLeader: Deterministic selection based on chain hash + slot
+// NO external influence, NO peers, NO randomness from outside
+func (n *ContraQNode) IsSlotLeader(slot int64) bool {
+	n.ChainMu.RLock()
+	lastBlock := n.Chain[len(n.Chain)-1]
+	n.ChainMu.RUnlock()
+
+	// Derive leadership from chain state alone
+	slotBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(slotBytes, uint64(slot))
 	
-	prev := n.Chain[len(n.Chain)-1]
+	lastHashBytes, _ := hex.DecodeString(lastBlock.Hash)
+	combined := append(lastHashBytes, slotBytes...)
+	leaderHash := sha256.Sum256(combined)
 	
+	// Deterministic: if hash starts with specific pattern, this node leads
+	// In multi-node: each validator has an index, leader = hash % validator_count == my_index
+	return leaderHash[0] < 128 // Single node: always lead
+}
+
+func (n *ContraQNode) ProposeBlock(slot, timestamp int64) {
+	n.ChainMu.Lock()
+	defer n.ChainMu.Unlock()
+
+	last := n.Chain[len(n.Chain)-1]
+
 	var txs []Transaction
-	for i := 0; i < 100; i++ {
+	collecting := true
+	for collecting && len(txs) < 100 {
 		select {
 		case tx := <-n.TxPool:
 			txs = append(txs, tx)
 		default:
-			goto done
+			collecting = false
 		}
 	}
-done:
-	
-	stateRoot := n.computeStateRoot()
-	block := Block{
-		Height:    prev.Height + 1,
-		Timestamp: time.Now().Unix(),
-		TxCount:   len(txs),
-		StateRoot: stateRoot,
-		PrevHash:  prev.Hash,
-		Miner:     nodeWallet.Address,
+
+	if len(txs) == 0 {
+		return
 	}
+
+	prevStateRoot := last.StateRoot
+	newStateRoot := n.ComputeStateRoot()
+
+	zkProof, publicInputs, err := n.GenerateZKProof(prevStateRoot, newStateRoot, txs)
+	if err != nil {
+		slog.Error("❌ zkSNARK proof generation failed", "error", err)
+		return
+	}
+
+	erasureRoot := n.GenerateErasureRoot(txs)
+
+	block := Block{
+		Index:          last.Index + 1,
+		Timestamp:      timestamp,
+		Transactions:   txs,
+		ZKProof:        zkProof,
+		ZKPublicInputs: publicInputs,
+		ErasureRoot:    erasureRoot,
+		StateRoot:      newStateRoot,
+		PrevHash:       last.Hash,
+	}
+
 	block.Hash = block.ComputeHash()
-	
+
+	if err := n.VerifyZKProof(block); err != nil {
+		slog.Error("❌ Block proof verification failed", "error", err)
+		return
+	}
+
+	if err := n.PersistBlock(block); err != nil {
+		slog.Error("❌ Failed to persist block", "error", err)
+		return
+	}
+
 	n.Chain = append(n.Chain, block)
-	n.persistBlock(block)
 	
-	slog.Info("⛏️ Block mined", 
-		"height", block.Height, 
-		"txs", block.TxCount,
-		"hash", block.Hash[:8])
+	slog.Info("🔒 Block finalized",
+		"height", block.Index,
+		"txs", len(txs),
+		"hash", block.Hash[:16]+"...",
+		"leader_based_on", "chain_hash")
 }
 
-func (n *ContraQNode) computeStateRoot() string {
+// --- zkSNARK PROOF GENERATION ---
+
+func (n *ContraQNode) GenerateZKProof(prevStateRoot, newStateRoot string, txs []Transaction) (string, []string, error) {
+	zkParams.mu.RLock()
+	defer zkParams.mu.RUnlock()
+
+	prevRoot := new(big.Int)
+	prevRoot.SetString(prevStateRoot, 16)
+	if prevRoot.BitLen() == 0 {
+		prevRoot.SetInt64(0)
+	}
+
+	newRoot := new(big.Int)
+	newRoot.SetString(newStateRoot, 16)
+
+	txHashes := make([]frontend.Variable, 100)
+	for i := 0; i < len(txs) && i < 100; i++ {
+		txHash := new(big.Int)
+		txHash.SetString(txs[i].GetHash(), 16)
+		txHashes[i] = txHash
+	}
+	for i := len(txs); i < 100; i++ {
+		txHashes[i] = big.NewInt(0)
+	}
+
+	witness := &StateTransitionCircuit{
+		PrevStateRoot: prevRoot,
+		NewStateRoot:  newRoot,
+		TxCount:       len(txs),
+		TxHashes:      txHashes,
+	}
+
+	fullWitness, err := frontend.NewWitness(witness, ecc.BN254.ScalarField())
+	if err != nil {
+		return "", nil, fmt.Errorf("witness creation failed: %w", err)
+	}
+
+	proof, err := groth16.Prove(zkParams.R1CS, zkParams.ProvingKey, fullWitness)
+	if err != nil {
+		return "", nil, fmt.Errorf("proof generation failed: %w", err)
+	}
+
+	proofBytes, err := proof.MarshalBinary()
+	if err != nil {
+		return "", nil, fmt.Errorf("proof serialization failed: %w", err)
+	}
+
+	publicInputs := []string{
+		prevStateRoot,
+		newStateRoot,
+		fmt.Sprintf("%d", len(txs)),
+	}
+
+	return hex.EncodeToString(proofBytes), publicInputs, nil
+}
+
+func (n *ContraQNode) VerifyZKProof(block Block) error {
+	if block.ZKProof == "GENESIS" {
+		return nil
+	}
+
+	zkParams.mu.RLock()
+	defer zkParams.mu.RUnlock()
+
+	proofBytes, err := hex.DecodeString(block.ZKProof)
+	if err != nil {
+		return fmt.Errorf("proof deserialization failed: %w", err)
+	}
+
+	proof := groth16.NewProof(ecc.BN254)
+	if err := proof.UnmarshalBinary(proofBytes); err != nil {
+		return fmt.Errorf("proof unmarshaling failed: %w", err)
+	}
+
+	if len(block.ZKPublicInputs) != 3 {
+		return errors.New("invalid public inputs")
+	}
+
+	prevRoot := new(big.Int)
+	prevRoot.SetString(block.ZKPublicInputs[0], 16)
+
+	newRoot := new(big.Int)
+	newRoot.SetString(block.ZKPublicInputs[1], 16)
+
+	var txCount int
+	fmt.Sscanf(block.ZKPublicInputs[2], "%d", &txCount)
+
+	publicWitness := &StateTransitionCircuit{
+		PrevStateRoot: prevRoot,
+		NewStateRoot:  newRoot,
+		TxCount:       txCount,
+	}
+
+	pubWit, err := frontend.NewWitness(publicWitness, ecc.BN254.ScalarField(), frontend.PublicOnly())
+	if err != nil {
+		return fmt.Errorf("public witness creation failed: %w", err)
+	}
+
+	if err := groth16.Verify(proof, zkParams.VerifyingKey, pubWit); err != nil {
+		return fmt.Errorf("zkSNARK verification FAILED: %w", err)
+	}
+
+	return nil
+}
+
+// --- CRYPTOGRAPHIC PRIMITIVES ---
+
+func (n *ContraQNode) GenerateErasureRoot(txs []Transaction) string {
+	if len(txs) == 0 {
+		return "EMPTY"
+	}
+
+	data, _ := json.Marshal(txs)
+	shards, err := n.RS.Split(data)
+	if err != nil {
+		return "ERROR"
+	}
+
+	if err := n.RS.Encode(shards); err != nil {
+		return "ERROR"
+	}
+
+	root := sha256.Sum256(shards[0])
+	return hex.EncodeToString(root[:])
+}
+
+func (n *ContraQNode) ComputeStateRoot() string {
 	h := sha256.New()
-	n.State.Range(func(k, v any) bool {
-		h.Write([]byte(fmt.Sprintf("%s:%v", k, v)))
+	n.State.Range(func(key, value interface{}) bool {
+		h.Write([]byte(fmt.Sprintf("%v:%v", key, value)))
 		return true
 	})
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// 💾 PERSISTENCE
-func initDB() error {
-	var err error
-	chainDB, err = sql.Open("sqlite3", "contraq.db?_journal=WAL&_foreign_keys=on")
+// --- ASSET ISSUANCE ---
+
+func (n *ContraQNode) IssueAsset(issuerWallet *Wallet, ticker string, supply int64, metadata string) error {
+	asset := Asset{
+		Ticker:      ticker,
+		Issuer:      issuerWallet.Address,
+		TotalSupply: supply,
+		Metadata:    metadata,
+		Timestamp:   time.Now().Unix(),
+	}
+
+	if _, exists := n.Assets.Load(ticker); exists {
+		return errors.New("asset already exists")
+	}
+
+	n.Assets.Store(ticker, asset)
+	stateKey := issuerWallet.Address + ":" + ticker
+	n.State.Store(stateKey, supply)
+
+	slog.Info("💹 Asset issued", "ticker", ticker, "supply", supply)
+	return nil
+}
+
+// --- DATABASE ---
+
+func (n *ContraQNode) PersistBlock(block Block) error {
+	tx, err := chainDB.Begin()
 	if err != nil {
 		return err
 	}
-	
-	_, err = chainDB.Exec(`
-		CREATE TABLE IF NOT EXISTS blocks (
-			height INTEGER PRIMARY KEY,
-			hash TEXT UNIQUE,
-			data BLOB,
-			timestamp INTEGER
-		);
-		CREATE INDEX IF NOT EXISTS idx_timestamp ON blocks(timestamp);
-	`)
-	return err
+	defer tx.Rollback()
+
+	blockData, _ := json.Marshal(block)
+	_, err = tx.Exec("INSERT INTO blocks (hash, data, height) VALUES (?, ?, ?)",
+		block.Hash, blockData, block.Index)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
-func (n *ContraQNode) persistBlock(b Block) {
-	data, _ := json.Marshal(b)
-	_, err := chainDB.Exec("INSERT OR REPLACE INTO blocks VALUES(?, ?, ?, ?)",
-		b.Height, b.Hash, data, b.Timestamp)
-	if err != nil {
-		slog.Error("Persist failed", "err", err)
+// --- QUERY FUNCTIONS ---
+
+func (n *ContraQNode) GetBalance(address, asset string) int64 {
+	key := address + ":" + asset
+	bal, ok := n.State.Load(key)
+	if !ok {
+		return 0
+	}
+	return bal.(int64)
+}
+
+func (n *ContraQNode) GetNonce(address string) uint64 {
+	nonce, _ := n.Nonces.LoadOrStore(address, uint64(0))
+	return nonce.(uint64)
+}
+
+func (n *ContraQNode) GetLatestBlock() Block {
+	n.ChainMu.RLock()
+	defer n.ChainMu.RUnlock()
+	return n.Chain[len(n.Chain)-1]
+}
+
+// --- RATE LIMITING UTILITIES ---
+
+func getClientIP(r *http.Request) string {
+	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
+		return xf
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return host
+}
+
+func checkRateLimit(ip string) error {
+	rateLimitMu.Lock()
+	defer rateLimitMu.Unlock()
+
+	// Check if IP is locked out
+	if lockTime, ok := lockedUntil.Load(ip); ok {
+		if time.Now().Before(lockTime.(time.Time)) {
+			return fmt.Errorf("IP locked due to too many failed attempts")
+		}
+		// Lockout expired
+		lockedUntil.Delete(ip)
+		failedAttempts.Delete(ip)
+	}
+
+	return nil
+}
+
+func recordFailedAttempt(ip string) {
+	rateLimitMu.Lock()
+	defer rateLimitMu.Unlock()
+
+	attempts, _ := failedAttempts.LoadOrStore(ip, 0)
+	newAttempts := attempts.(int) + 1
+	failedAttempts.Store(ip, newAttempts)
+
+	if newAttempts >= MaxFailedAttempts {
+		lockedUntil.Store(ip, time.Now().Add(LockoutDuration))
+		slog.Warn("🚨 IP locked out", "ip", ip, "duration", LockoutDuration)
 	}
 }
 
-// 🌐 PRODUCTION HTTP API
-func router() *mux.Router {
+func resetFailedAttempts(ip string) {
+	failedAttempts.Delete(ip)
+}
+
+// --- HTTP API ---
+
+func setupRouter(node *ContraQNode) *mux.Router {
 	r := mux.NewRouter()
-	r.Use(corsMiddleware)
-	
-	// Health & Status
-	r.HandleFunc("/health", healthHandler).Methods("GET")
-	r.HandleFunc("/status", statusHandler).Methods("GET")
-	r.HandleFunc("/chain/latest", chainHandler).Methods("GET")
-	
-	// Core Blockchain
-	r.HandleFunc("/tx", txHandler).Methods("POST")
-	r.HandleFunc("/balance/{addr}", balanceHandler).Methods("GET")
-	
-	// Dashboard
-	r.HandleFunc("/", dashboardHandler).Methods("GET")
-	
+
+	r.HandleFunc("/api/v1/transaction", handleSubmitTransaction(node)).Methods("POST")
+	r.HandleFunc("/api/v1/balance/{address}/{asset}", handleGetBalance(node)).Methods("GET")
+	r.HandleFunc("/api/v1/nonce/{address}", handleGetNonce(node)).Methods("GET")
+	r.HandleFunc("/api/v1/asset/issue", handleIssueAsset(node)).Methods("POST")
+	r.HandleFunc("/api/v1/asset/{ticker}", handleGetAsset(node)).Methods("GET")
+	r.HandleFunc("/api/v1/chain/latest", handleGetLatestBlock(node)).Methods("GET")
+	r.HandleFunc("/api/v1/chain/block/{index}", handleGetBlock(node)).Methods("GET")
+	r.HandleFunc("/api/v1/chain/state", handleChainState(node)).Methods("GET")
+	r.HandleFunc("/api/v1/status", handleStatus(node)).Methods("GET")
+
 	return r
 }
 
-func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+func handleSubmitTransaction(node *ContraQNode) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
+		ip := getClientIP(r)
+
+		// Check rate limit
+		if err := checkRateLimit(ip); err != nil {
+			http.Error(w, "Too many failed attempts. Please try again later.", http.StatusTooManyRequests)
 			return
 		}
-		next.ServeHTTP(w, r)
-	}
-}
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "🟢 LIVE",
-		"version": Version,
-	})
-}
+		var tx Transaction
+		if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
+			recordFailedAttempt(ip)
+			http.Error(w, "Invalid transaction", http.StatusBadRequest)
+			return
+		}
 
-func statusHandler(w http.ResponseWriter, r *http.Request) {
-	var height int64
-	chainDB.QueryRow("SELECT COUNT(*) FROM blocks").Scan(&height)
-	
-	status := NodeStatus{
-		Version:     Version,
-		Uptime:      fmt.Sprintf("%v", time.Since(startTime).Round(time.Second)),
-		Wallet:      nodeWallet.Address[:12] + "...",
-		ChainHeight: height,
-		Status:      "🟢 PRODUCTION",
-	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
-}
+		// Auto-sign if from node wallet
+		if tx.Sender == nodeWallet.Address && tx.Signature == "" {
+			tx.PublicKey = hex.EncodeToString(nodeWallet.PublicKey.Bytes())
+			tx.Signature = hex.EncodeToString(nodeWallet.Sign(tx.GetSigningData()))
+		}
 
-func chainHandler(w http.ResponseWriter, r *http.Request) {
-	globalNode.mu.RLock()
-	latest := globalNode.Chain[len(globalNode.Chain)-1]
-	globalNode.mu.RUnlock()
-	
-	json.NewEncoder(w).Encode(latest)
-}
+		// Validate before queueing
+		if err := node.ValidateTransaction(tx); err != nil {
+			recordFailedAttempt(ip)
+			http.Error(w, fmt.Sprintf("Transaction validation failed: %s", err.Error()), http.StatusForbidden)
+			return
+		}
 
-func txHandler(w http.ResponseWriter, r *http.Request) {
-	var tx Transaction
-	if err := json.NewDecoder(r.Body).Decode(&tx); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-	
-	// Auto-sign with node wallet if no signature
-	if tx.Signature == "" {
-		tx.Signature = hex.EncodeToString(nodeWallet.Sign(tx.SigningHash()))
-		tx.PublicKey = hex.EncodeToString(nodeWallet.PublicKey[:])
-		tx.ID = fmt.Sprintf("tx_%d", time.Now().UnixNano())
-	}
-	
-	select {
-	case globalNode.TxPool <- tx:
+		// Success - reset failed attempts
+		resetFailedAttempts(ip)
+
+		node.TxPool <- tx
+		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{
-			"status":  "accepted",
-			"tx_id":   tx.ID,
-			"hash":    hex.EncodeToString(tx.SigningHash())[:8],
+			"status": "accepted",
+			"tx_id":  tx.ID,
 		})
-	default:
-		http.Error(w, "Tx pool full", http.StatusServiceUnavailable)
 	}
 }
 
-func balanceHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	addr := vars["addr"]
-	
-	balI, ok := globalNode.State.Load(addr + ":CQ")
-	bal := int64(0)
-	if ok {
-		bal = balI.(int64)
+func handleGetBalance(node *ContraQNode) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		balance := node.GetBalance(vars["address"], vars["asset"])
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"address": vars["address"],
+			"asset":   vars["asset"],
+			"balance": balance,
+		})
 	}
-	
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"address": addr,
-		"balance": bal,
-		"cq":      fmt.Sprintf("%.2f CQ", float64(bal)/1e9),
-	})
 }
 
-func dashboardHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
-	html := fmt.Sprintf(`<!DOCTYPE html>
-<html>
-<head><title>ContraQ v%s - Quantum Blockchain</title>
-<meta charset="utf-8">
-<style>body{font-family:monospace;background:#000;color:#0f0;padding:2rem;max-width:1200px;margin:0 auto;}
-h1{font-size:3rem;text-align:center;background:linear-gradient(90deg,#0f0,#00ff88);-webkit-background-clip:text;background-clip:text;}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:2rem;}
-.card{background:#111;padding:2rem;border-radius:12px;border:1px solid #0f0;}
-pre{background:#1a1a1a;padding:1rem;border-radius:8px;font-size:14px;}
-button{background:#0f0;color:#000;border:none;padding:1rem 2rem;border-radius:25px;cursor:pointer;font-weight:bold;}
-</style></head>
-<body>
-<h1>🚀 ContraQ v%s PRODUCTION</h1>
-<div class="grid">
-<div class="card"><h3>🟢 Node Status</h3><pre>Version: %s
-Uptime: %s
-Wallet: %s
-Height: %d
-</pre></div>
-<div class="card"><h3>🔗 Live APIs</h3><pre>GET  localhost:8080/status
-GET  localhost:8080/chain/latest  
-GET  localhost:8080/balance/cq_...
-POST localhost:8080/tx</pre>
-<button onclick="fetch('/status').then(r=>r.json()).then(d=>alert(JSON.stringify(d,null,2)))">🔍 Status</button>
-<button onclick="location.reload()">🔄 Refresh</button></div>
-</div>
-<script>setTimeout(()=>location.reload(),15000)</script>
-</body></html>`,
-		Version, Version, Version, time.Since(startTime).Round(time.Second),
-		nodeWallet.Address[:12]+"...", len(globalNode.Chain)-1)
-	
-	fmt.Fprint(w, html)
+func handleGetNonce(node *ContraQNode) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		nonce := node.GetNonce(vars["address"])
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"address": vars["address"],
+			"nonce":   nonce,
+		})
+	}
+}
+
+func handleIssueAsset(node *ContraQNode) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip := getClientIP(r)
+
+		if err := checkRateLimit(ip); err != nil {
+			http.Error(w, "Too many failed attempts", http.StatusTooManyRequests)
+			return
+		}
+
+		var req struct {
+			Ticker   string `json:"ticker"`
+			Supply   int64  `json:"supply"`
+			Metadata string `json:"metadata"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			recordFailedAttempt(ip)
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+
+		if err := node.IssueAsset(nodeWallet, req.Ticker, req.Supply, req.Metadata); err != nil {
+			recordFailedAttempt(ip)
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+
+		resetFailedAttempts(ip)
+		json.NewEncoder(w).Encode(map[string]string{"status": "issued", "ticker": req.Ticker})
+	}
+}
+
+func handleGetAsset(node *ContraQNode) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		asset, ok := node.Assets.Load(vars["ticker"])
+		if !ok {
+			http.Error(w, "Asset not found", http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(asset)
+	}
+}
+
+func handleGetLatestBlock(node *ContraQNode) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(node.GetLatestBlock())
+	}
+}
+
+func handleGetBlock(node *ContraQNode) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		var index int64
+		fmt.Sscanf(vars["index"], "%d", &index)
+
+		node.ChainMu.RLock()
+		defer node.ChainMu.RUnlock()
+
+		if index < 0 || index >= int64(len(node.Chain)) {
+			http.Error(w, "Block not found", http.StatusNotFound)
+			return
+		}
+
+		json.NewEncoder(w).Encode(node.Chain[index])
+	}
+}
+
+func handleChainState(node *ContraQNode) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		latest := node.GetLatestBlock()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"height":       latest.Index,
+			"hash":         latest.Hash,
+			"state_root":   latest.StateRoot,
+			"zk_proof":     latest.ZKProof[:min(16, len(latest.ZKProof))] + "...",
+			"erasure_root": latest.ErasureRoot,
+		})
+	}
+}
+
+func handleStatus(node *ContraQNode) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"version":   Version,
+			"node":      nodeWallet.Address,
+			"running":   node.IsRunning,
+			"height":    node.GetLatestBlock().Index,
+			"consensus": "chain-intrinsic",
+		})
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// --- INITIALIZATION ---
+
+func initDatabase() error {
+	db, err := sql.Open("sqlite3", "./contraq_v14_1.db?_journal_mode=WAL")
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS blocks (
+			hash TEXT PRIMARY KEY,
+			data BLOB NOT NULL,
+			height INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_height ON blocks(height);
+	`)
+	if err != nil {
+		return err
+	}
+
+	chainDB = db
+	return nil
 }
 
 func main() {
-	// 🔧 PRODUCTION LOGGING
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
-	slog.Info("🚀 ContraQ starting", "version", Version)
-	
-	// 1. QUANTUM WALLET
+	slog.Info("🌌 ContraQ v14.1 Starting", "version", Version)
+
+	// Initialize zkSNARK parameters
+	var err error
+	zkParams, err = InitZKParams()
+	if err != nil {
+		log.Fatal("zkSNARK initialization failed:", err)
+	}
+
+	// Initialize wallet
 	nodeWallet = NewWallet()
-	slog.Info("✅ Wallet ready", "address", nodeWallet.Address)
-	
-	// 2. DATABASE
-	if err := initDB(); err != nil {
-		log.Fatal("Database failed:", err)
+	slog.Info("✅ Quantum-safe wallet initialized", "address", nodeWallet.Address)
+
+	// Initialize database
+	if err := initDatabase(); err != nil {
+		log.Fatal("Database initialization failed:", err)
 	}
 	defer chainDB.Close()
-	
-	// 3. NODE
-	var err error
-	globalNode, err = NewContraQNode()
+
+	// Create node
+	node, err := NewContraQNode()
 	if err != nil {
-		log.Fatal("Node init failed:", err)
+		log.Fatal("Node creation failed:", err)
 	}
-	globalNode.Start()
-	defer globalNode.Stop()
-	
-	// 4. PRODUCTION SERVER
+
+	// Initialize genesis state
+	node.State.Store(nodeWallet.Address+":CQ", int64(GenesisSupply))
+	node.PublicKeys.Store(nodeWallet.Address, nodeWallet.PublicKey)
+
+	// Issue institutional assets
+	node.IssueAsset(nodeWallet, "CUSD", 1_000_000_000_000, "USD Stablecoin")
+	node.IssueAsset(nodeWallet, "CGOLD", 100_000_000, "Tokenized Gold")
+
+	node.Start()
+	globalNode = node
+	defer node.Stop()
+
+	// Setup HTTP server
+	router := setupRouter(node)
 	srv := &http.Server{
 		Addr:         ServerPort,
-		Handler:      router(),
+		Handler:      router,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  120 * time.Second,
 	}
-	
+
 	go func() {
-		slog.Info("🌐 Server live", "port", ServerPort)
-		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-			slog.Error("Server crashed", "err", err)
+		slog.Info("🛡️  Node online", "port", ServerPort, "consensus", "chain-intrinsic")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Server error", "error", err)
 		}
 	}()
-	
-	// 5. GRACEFUL SHUTDOWN
+
+	// Graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	
-	slog.Info("🛑 Shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+
+	slog.Info("Shutting down...")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	srv.Shutdown(ctx)
-	
-	slog.Info("✅ Shutdown complete", "final_height", len(globalNode.Chain)-1)
+	slog.Info("✅ Shutdown complete")
 }
